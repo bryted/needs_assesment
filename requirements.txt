@@ -1,5 +1,6 @@
 pandas
 openpyxl
 plotly
-streamlit
+streamlit==1.19.0
+altair<5
 kaleido
