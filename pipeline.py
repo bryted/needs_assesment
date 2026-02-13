@@ -428,6 +428,151 @@ def _build_cooperative_label(
     return name.astype("string") + " (" + coop_id.astype("string") + ")"
 
 
+def _build_cooperative_excel_extract(
+    tables: dict[str, pd.DataFrame], out_path: Path, top_n: int = 15
+) -> str:
+    cl = tables["cl_child_master"].copy()
+    rchild = tables["rem_child_long"].copy()
+    rhh = tables["rem_hh_long"].copy()
+    rcom = tables["rem_com_priority"].copy()
+
+    rchild = _drop_generic_other_specify(rchild, "ChildItem")
+    rhh = _drop_generic_other_specify(rhh, "HhItem")
+    rcom = _drop_generic_other_specify(rcom, "ComItem")
+
+    cooperatives = sorted(cl["CooperativeLabel"].dropna().astype(str).unique().tolist())
+
+    priority_rows: list[pd.DataFrame] = []
+    pathway_rows: list[pd.DataFrame] = []
+
+    for cooperative in cooperatives:
+        cl_coop = cl[cl["CooperativeLabel"].astype("string") == cooperative].copy()
+        if cl_coop.empty:
+            continue
+
+        rchild_coop = rchild[rchild["CooperativeLabel"].astype("string") == cooperative].copy()
+        rhh_coop = rhh[rhh["CooperativeLabel"].astype("string") == cooperative].copy()
+        rcom_coop = rcom[rcom["CooperativeLabel"].astype("string") == cooperative].copy()
+
+        child_top = (
+            rchild_coop.groupby("ChildItem", dropna=False)["ChldID"]
+            .nunique()
+            .reset_index(name="Count")
+            .sort_values(["Count", "ChildItem"], ascending=[False, True])
+            .head(top_n)
+        )
+        if not child_top.empty:
+            child_top["CooperativeLabel"] = cooperative
+            child_top["Level"] = "Child"
+            child_top["Item"] = child_top["ChildItem"].astype("string")
+            child_top["CountBasis"] = "Unique children"
+            child_top["Rank"] = range(1, len(child_top) + 1)
+            priority_rows.append(child_top[["CooperativeLabel", "Level", "Rank", "Item", "Count", "CountBasis"]])
+
+        hh_top = (
+            rhh_coop.groupby("HhItem", dropna=False)["FarmerID"]
+            .nunique()
+            .reset_index(name="Count")
+            .sort_values(["Count", "HhItem"], ascending=[False, True])
+            .head(top_n)
+        )
+        if not hh_top.empty:
+            hh_top["CooperativeLabel"] = cooperative
+            hh_top["Level"] = "Household"
+            hh_top["Item"] = hh_top["HhItem"].astype("string")
+            hh_top["CountBasis"] = "Unique households"
+            hh_top["Rank"] = range(1, len(hh_top) + 1)
+            priority_rows.append(hh_top[["CooperativeLabel", "Level", "Rank", "Item", "Count", "CountBasis"]])
+
+        com_children = cl_coop[["ChldID", "ComID"]].drop_duplicates()
+        com_top = (
+            rcom_coop[["ComID", "ComItem"]]
+            .drop_duplicates()
+            .merge(com_children, on="ComID", how="inner")
+            .groupby("ComItem", dropna=False)["ChldID"]
+            .nunique()
+            .reset_index(name="Count")
+            .sort_values(["Count", "ComItem"], ascending=[False, True])
+            .head(top_n)
+        )
+        if not com_top.empty:
+            com_top["CooperativeLabel"] = cooperative
+            com_top["Level"] = "Community"
+            com_top["Item"] = com_top["ComItem"].astype("string")
+            com_top["CountBasis"] = "Unique children in communities needing item"
+            com_top["Rank"] = range(1, len(com_top) + 1)
+            priority_rows.append(com_top[["CooperativeLabel", "Level", "Rank", "Item", "Count", "CountBasis"]])
+
+        paths = _build_sankey_paths(cl_coop, rchild_coop, rhh_coop, rcom_coop)
+        if not paths.empty:
+            path_top = (
+                paths.groupby(["ChildNode", "HouseholdNode", "CommunityNode"], dropna=False)["ChldID"]
+                .nunique()
+                .reset_index(name="Children")
+                .sort_values(
+                    ["Children", "ChildNode", "HouseholdNode", "CommunityNode"],
+                    ascending=[False, True, True, True],
+                )
+                .head(top_n)
+            )
+            path_top["CooperativeLabel"] = cooperative
+            path_top["Rank"] = range(1, len(path_top) + 1)
+            pathway_rows.append(
+                path_top[
+                    [
+                        "CooperativeLabel",
+                        "Rank",
+                        "ChildNode",
+                        "HouseholdNode",
+                        "CommunityNode",
+                        "Children",
+                    ]
+                ]
+            )
+
+    priorities = (
+        pd.concat(priority_rows, ignore_index=True)
+        if priority_rows
+        else pd.DataFrame(columns=["CooperativeLabel", "Level", "Rank", "Item", "Count", "CountBasis"])
+    )
+    pathways = (
+        pd.concat(pathway_rows, ignore_index=True)
+        if pathway_rows
+        else pd.DataFrame(
+            columns=["CooperativeLabel", "Rank", "ChildNode", "HouseholdNode", "CommunityNode", "Children"]
+        )
+    )
+
+    summary = (
+        cl.groupby(["CooperativeID", "CooperativeName", "CooperativeLabel"], dropna=False)
+        .agg(
+            cl_children=("ChldID", "nunique"),
+            cl_households=("FarmerID", "nunique"),
+            avg_hazards=("HazardCount", "mean"),
+            avg_total_rem=("TotalRemCount", "mean"),
+        )
+        .reset_index()
+        .sort_values("CooperativeLabel")
+    )
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="cooperative_summary", index=False)
+        priorities.to_excel(writer, sheet_name="remediation_priorities", index=False)
+        pathways.to_excel(writer, sheet_name="common_pathways", index=False)
+
+    return str(out_path)
+
+
+def export_cooperative_excel_extract(
+    tables: dict[str, pd.DataFrame],
+    out_path: str = "outputs/tables/cooperative_figure_extract.xlsx",
+    top_n: int = 15,
+) -> str:
+    target = Path(out_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return _build_cooperative_excel_extract(tables=tables, out_path=target, top_n=top_n)
+
+
 def _get_level_item_map(
     df: pd.DataFrame, entity_col: str, item_col: str, fallback_label: str
 ) -> dict[str, str]:
@@ -1507,6 +1652,11 @@ def build_outputs(
         "rem_com_priority": rem_com_priority,
         "planning_quantities_by_cooperative": planning,
     }
+    cooperative_extract_path = export_cooperative_excel_extract(
+        tables=tables,
+        out_path=str(TABLE_DIR / "cooperative_figure_extract.xlsx"),
+        top_n=15,
+    )
 
     chart_paths: list[str] = []
     if export_charts:
@@ -1541,6 +1691,7 @@ def build_outputs(
             str(TABLE_DIR / "rem_hh_long.csv"),
             str(TABLE_DIR / "rem_com_priority.csv"),
             str(TABLE_DIR / "planning_quantities_by_cooperative.xlsx"),
+            cooperative_extract_path,
         ],
         "output_charts": chart_paths,
         "cooperative_export": cooperative_export,

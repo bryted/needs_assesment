@@ -13,12 +13,18 @@ from pipeline import (
     export_png_pack_by_cooperative,
     load_prepared_tables,
 )
+try:
+    from pipeline import export_cooperative_excel_extract
+except ImportError:
+    export_cooperative_excel_extract = None
 
 st.set_page_config(page_title="CL Case Remediation Dashboard", layout="wide")
 st.title("CL Case-to-Remediation Dashboard")
 
 if "tables" not in st.session_state:
     st.session_state["tables"] = None
+if "cooperative_extract_path" not in st.session_state:
+    st.session_state["cooperative_extract_path"] = None
 
 
 @st.cache_data(show_spinner=False)
@@ -194,4 +200,30 @@ if st.button("Export PNG packs by Cooperative"):
         st.error(
             "Cooperative bulk export failed. Ensure `kaleido` is installed and Chrome is available on the host. "
             f"Details: {exc}"
+        )
+
+if st.button("Generate cooperative Excel extract"):
+    if export_cooperative_excel_extract is None:
+        st.error("Current pipeline module does not expose `export_cooperative_excel_extract`. Update/redeploy to latest code.")
+    else:
+        try:
+            extract_path = export_cooperative_excel_extract(
+                tables=tables,
+                out_path="outputs/tables/cooperative_figure_extract.xlsx",
+                top_n=15,
+            )
+            st.session_state["cooperative_extract_path"] = extract_path
+            st.success("Cooperative Excel extract generated.")
+        except Exception as exc:
+            st.error(f"Failed to generate cooperative Excel extract: {exc}")
+
+extract_candidate = st.session_state.get("cooperative_extract_path") or "outputs/tables/cooperative_figure_extract.xlsx"
+extract_file = Path(extract_candidate)
+if extract_file.exists():
+    with extract_file.open("rb") as fh:
+        st.download_button(
+            "Download cooperative Excel extract",
+            data=fh.read(),
+            file_name=extract_file.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
