@@ -203,6 +203,26 @@ def _find_column(columns: list[str], exact: str, fallback_patterns: list[str]) -
     )
 
 
+def _find_optional_column(columns: list[str], exact: str, fallback_patterns: list[str]) -> str | None:
+    try:
+        return _find_column(columns, exact, fallback_patterns)
+    except KeyError:
+        return None
+
+
+def _compose_item_with_other(item_series: pd.Series, other_series: pd.Series | None) -> pd.Series:
+    item_clean = _normalize_label(item_series)
+    if other_series is None:
+        return item_clean
+    other_clean = _normalize_label(other_series)
+    is_other = item_clean.fillna("").str.contains("other", case=False, regex=False)
+    has_other_text = other_clean.notna() & (other_clean.str.len() > 0)
+    out = item_clean.where(~(is_other & has_other_text), "Other: " + other_clean.astype("string"))
+    # Drop generic "Other (specify)" rows without a concrete specified value.
+    out = out.mask(is_other & ~has_other_text, pd.NA)
+    return out
+
+
 def _detect_hazard_columns(df: pd.DataFrame) -> list[str]:
     hazard_cols: list[str] = []
     for col in df.columns:
@@ -391,6 +411,15 @@ def _safe_path_token(value: str) -> str:
     return token or "unknown"
 
 
+def _drop_generic_other_specify(df: pd.DataFrame, item_col: str) -> pd.DataFrame:
+    if df.empty or item_col not in df.columns:
+        return df
+    out = df.copy()
+    labels = out[item_col].astype("string").str.strip()
+    generic_other = labels.str.fullmatch(r"(?i)other\s*\(specify\)\s*:?\s*")
+    return out[~generic_other.fillna(False)].copy()
+
+
 def _build_cooperative_label(
     cooperative_name: pd.Series, cooperative_id: pd.Series
 ) -> pd.Series:
@@ -542,6 +571,9 @@ def build_figures(
     rchild = _filter_table(tables["rem_child_long"], cooperative_filter, community_filter)
     rhh = _filter_table(tables["rem_hh_long"], cooperative_filter, community_filter)
     rcom = _filter_table(tables["rem_com_priority"], cooperative_filter, community_filter)
+    rchild = _drop_generic_other_specify(rchild, "ChildItem")
+    rhh = _drop_generic_other_specify(rhh, "HhItem")
+    rcom = _drop_generic_other_specify(rcom, "ComItem")
 
     cooperative_order = [str(d).strip() for d in cooperative_filter if str(d).strip()]
     for frame in [cl, hz, rchild, rhh, rcom]:
@@ -580,7 +612,12 @@ def build_figures(
         color_discrete_sequence=[COLOR_PRIMARY_FACT],
         category_orders={"CooperativeLabel": cooperative_order or children_by_cooperative["CooperativeLabel"].astype(str).tolist()},
     )
-    figures["01_cl_children_by_cooperative"].update_traces(marker_line_width=0)
+    figures["01_cl_children_by_cooperative"].update_traces(
+        marker_line_width=0,
+        text=children_by_cooperative["CLChildren"],
+        textposition="outside",
+        cliponaxis=False,
+    )
 
     cooperative_summary = (
         cl.groupby("CooperativeLabel", dropna=False)
@@ -699,7 +736,7 @@ def build_figures(
             text_auto=".1f",
             title="Hazard signature heatmap (% CL children)",
             labels={"Pct": "% CL children"},
-            color_continuous_scale=ICI_HEAT,
+            color_continuous_scale="YlOrRd",
             category_orders={"CooperativeLabel": cooperative_order or hz_matrix["CooperativeLabel"].astype(str).tolist()},
         )
 
@@ -744,6 +781,9 @@ def build_figures(
     figures["10_workload_depth"].update_traces(
         marker_line_width=0,
         opacity=0.88,
+        text=workload_depth["AvgTotalRem"].round(2),
+        textposition="outside",
+        cliponaxis=False,
         hovertemplate=(
             "Cooperative %{y}<br>"
             "Average remediation needs/child: %{x:.2f}<br>"
@@ -775,6 +815,9 @@ def build_figures(
         )
         figures["06_top_child_items"].update_traces(
             marker_line_width=0,
+            text=top_child["Children"],
+            textposition="outside",
+            cliponaxis=False,
             hovertemplate="Item: %{y}<br>Children (count): %{x:.0f}<extra></extra>",
         )
         child_tickvals = _nice_integer_tick_values(int(top_child["Children"].max()) if not top_child.empty else 1)
@@ -809,6 +852,9 @@ def build_figures(
         )
         figures["07_top_household_items"].update_traces(
             marker_line_width=0,
+            text=top_hh["Households"],
+            textposition="outside",
+            cliponaxis=False,
             hovertemplate="Item: %{y}<br>Households (count): %{x:.0f}<extra></extra>",
         )
         hh_tickvals = _nice_integer_tick_values(int(top_hh["Households"].max()) if not top_hh.empty else 1)
@@ -847,6 +893,9 @@ def build_figures(
         )
         figures["08_top_community_items"].update_traces(
             marker_line_width=0,
+            text=top_com["Children"],
+            textposition="outside",
+            cliponaxis=False,
             hovertemplate="Item: %{y}<br>Children (count): %{x:.0f}<extra></extra>",
         )
         com_tickvals = _nice_integer_tick_values(int(top_com["Children"].max()) if not top_com.empty else 1)
@@ -1288,17 +1337,35 @@ def build_outputs(
         "D 32 label remediation",
         ["d 32", "child remediation", "label remediation"],
     )
+    child_other_col = _find_optional_column(
+        list(rem_child.columns),
+        "D 32 remediation other",
+        ["remediation other", "other", "d 32"],
+    )
     hh_id_col = _find_column(list(rem_hh.columns), "D 07 child clmrs code", ["child clmrs code", "clmrs code"])
     hh_label_col = _find_column(list(rem_hh.columns), "D 33 label remediation", ["d 33", "label remediation"])
+    hh_other_col = _find_optional_column(
+        list(rem_hh.columns),
+        "D 33 remediation other",
+        ["remediation other", "other", "d 33"],
+    )
     com_id_col = _find_column(list(rem_com.columns), "D 07 child clmrs code", ["child clmrs code", "clmrs code"])
     com_label_col = _find_column(list(rem_com.columns), "D 34 label remediation", ["d 34", "label remediation"])
+    com_other_col = _find_optional_column(
+        list(rem_com.columns),
+        "D 34 remediation other",
+        ["remediation other", "other", "d 34"],
+    )
 
     cl_child_set = set(cl_base["ChldID"].dropna().tolist())
 
-    def _prep_rem(df: pd.DataFrame, id_col: str, label_col: str) -> tuple[pd.DataFrame, dict[str, int]]:
+    def _prep_rem(
+        df: pd.DataFrame, id_col: str, label_col: str, other_col: str | None = None
+    ) -> tuple[pd.DataFrame, dict[str, int]]:
         out = df.copy()
         out["ChldID"] = _normalize_identifier(out[id_col])
-        out["Item"] = _normalize_label(out[label_col])
+        other_series = out[other_col] if (other_col and other_col in out.columns) else None
+        out["Item"] = _compose_item_with_other(out[label_col], other_series)
         out = out[out["ChldID"].notna() & out["Item"].notna()].copy()
 
         stats = {
@@ -1310,9 +1377,9 @@ def build_outputs(
         out = out[out["ChldID"].isin(cl_child_set)].copy()
         return out, stats
 
-    rem_child_clean, rem_child_stats = _prep_rem(rem_child, child_id_col, child_label_col)
-    rem_hh_clean, rem_hh_stats = _prep_rem(rem_hh, hh_id_col, hh_label_col)
-    rem_com_clean, rem_com_stats = _prep_rem(rem_com, com_id_col, com_label_col)
+    rem_child_clean, rem_child_stats = _prep_rem(rem_child, child_id_col, child_label_col, child_other_col)
+    rem_hh_clean, rem_hh_stats = _prep_rem(rem_hh, hh_id_col, hh_label_col, hh_other_col)
+    rem_com_clean, rem_com_stats = _prep_rem(rem_com, com_id_col, com_label_col, com_other_col)
 
     geo_cols = [
         "ChldID",
